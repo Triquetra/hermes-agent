@@ -592,43 +592,58 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
 
 
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
-    or unblock since the last ``blocked`` event."""
+    """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no discharge
+    and no engagement inside that same window.
+
+    Staleness is aged from the newest of the last ``blocked`` event and the
+    newest ``commented`` event. A comment re-arms the window — the upstream
+    intent is "the human just engaged, stop nagging", not "the block is
+    resolved" — so a comment that is itself older than the threshold leaves the
+    card stale and reported. An ``unblocked`` event after the block is a real
+    discharge and suppresses the rule regardless of its age.
+    """
     hours = float(cfg.get("blocked_stale_hours", 24))
     if _task_field(task, "status") != "blocked":
         return []
     last_blocked_ts = _latest_event_ts(events, {"blocked"})
     if last_blocked_ts == 0:
         return []
-    age_hours = (now - last_blocked_ts) / 3600.0
+    if _latest_event_ts(events, {"unblocked"}) > last_blocked_ts:
+        return []
+    last_comment_ts = _latest_event_ts(events, {"commented"})
+    rearm_ts = max(last_blocked_ts, last_comment_ts)
+    age_hours = (now - rearm_ts) / 3600.0
     if age_hours < hours:
         return []
-    # Any comment / unblock after the block breaks the "stale" signal.
-    if any(_event_kind(ev) in {"commented", "unblocked"} and _event_ts(ev) > last_blocked_ts
-           for ev in events):
-        return []
+    blocked_hours = (now - last_blocked_ts) / 3600.0
+    detail = (
+        f"This task transitioned to blocked {int(blocked_hours)}h ago and has had no comment or "
+        f"unblock for {int(age_hours)}h. Blocked tasks are waiting for human input — check the "
+        f"block reason and either unblock with feedback or answer with a comment."
+    )
+    if last_comment_ts > last_blocked_ts:
+        detail += (" The newest comment predates the stale threshold and did not resolve the "
+                   "block: commenting again re-arms the nag window, unblocking discharges it.")
     return [Diagnostic(
         kind="stuck_in_blocked", severity="warning",
-        title=f"Task has been blocked for {int(age_hours)}h",
-        detail=f"This task transitioned to blocked {int(age_hours)}h ago and has had no comments or "
-               f"unblock attempts since. Blocked tasks are waiting for human input — check the block "
-               f"reason and either unblock with feedback or answer with a comment.",
+        title=f"Task has been blocked for {int(blocked_hours)}h",
+        detail=detail,
         actions=[DiagnosticAction(kind="comment", label="Add a comment / unblock the task",
                                   suggested=True)],
-        first_seen_at=last_blocked_ts, last_seen_at=last_blocked_ts, count=1,
-        data={"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)},
+        first_seen_at=last_blocked_ts, last_seen_at=rearm_ts, count=1,
+        data={"blocked_at": last_blocked_ts, "blocked_hours": round(blocked_hours, 1),
+              "comment_at": last_comment_ts or None, "age_hours": round(age_hours, 1)},
     )]
 
 
 def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
     """>= cfg["block_cycle_threshold"] (default 3) blocked-after-unblocked
     cycles within cfg["block_cycle_window_seconds"] (default 24h). Complements
-    ``_rule_stuck_in_blocked``, whose timer any unblock resets, so fast cyclers
-    are invisible to it.
-
-    ``_rule_stuck_in_blocked`` resets its timer on any ``commented`` / ``unblocked`` event, so a task that
-    cycles every few minutes is invisible to it regardless of how many times it cycles (#29747 gap 1). This
-    rule complements that one by counting block→unblock cycles in a sliding window.
+    ``_rule_stuck_in_blocked``, whose stale age a fast cycler never reaches: each
+    cycle re-arms it, and it fires only once the newest block/comment is itself
+    older than ``blocked_stale_hours`` — a task cycling every few minutes stays
+    invisible to it regardless of how many times it cycles (#29747 gap 1). This
+    rule complements that one by counting block→unblock cycles in a window.
     """
     threshold = _positive_int(cfg.get("block_cycle_threshold"), 3)
     window_seconds = float(cfg.get("block_cycle_window_seconds", 24 * 3600))

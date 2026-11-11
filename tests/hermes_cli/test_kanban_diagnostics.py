@@ -111,6 +111,94 @@ def test_stuck_in_blocked_fires_past_threshold():
     assert d.data["age_hours"] >= 48
 
 
+def test_stuck_in_blocked_rearms_after_a_stale_comment():
+    """A comment re-arms the nag window; it does not discharge the block forever.
+
+    Blocked 30 h ago with its newest comment 29 h ago: the engagement itself is
+    older than ``blocked_stale_hours`` (24), so the card is stale again and must
+    be reported. Pre-fix any comment ever silenced the rule permanently.
+    """
+    now = 1_800_000_000
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=now - 3600 * 30, reason="waiting on a human"),
+        _event("commented", ts=now - 3600 * 29, body="noted, still waiting"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    d = diags[0]
+    assert d.data["age_hours"] == pytest.approx(29, abs=0.1)  # aged from the comment
+    assert d.data["comment_at"] == now - 3600 * 29
+    assert "did not resolve" in d.detail
+
+
+def test_stuck_in_blocked_silent_after_a_recent_comment():
+    """No nag right after a human engaged: a comment 2 h old keeps the card quiet."""
+    now = 1_800_000_000
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=now - 3600 * 30, reason="waiting on a human"),
+        _event("commented", ts=now - 3600 * 2, body="on it"),
+    ]
+    assert kd.compute_task_diagnostics(task, events, [], now=now) == []
+
+
+def test_stuck_in_blocked_silent_after_an_unblock():
+    """``unblocked`` is a real discharge, not an engagement beat: once it lands
+    after the block it suppresses the rule regardless of its age."""
+    now = 1_800_000_000
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=now - 3600 * 30, reason="waiting on a human"),
+        _event("unblocked", ts=now - 3600 * 29),
+    ]
+    assert kd.compute_task_diagnostics(task, events, [], now=now) == []
+
+
+def test_stuck_in_blocked_reports_a_parks_with_only_an_old_comment(kanban_home):
+    """Board-shaped repro: a calendar wait parked ``blocked`` with one early
+    evidence note stayed invisible to ``hermes kanban diagnostics --task <id>``
+    for 8 days.
+
+    Real history: created ``initial_status=blocked`` at 2026-11-02T12:00:30Z
+    (``create_task`` writes the ``blocked`` event), one comment 5m53s later
+    saying "wait for 2026-11-09", status still ``blocked`` 8 days on. The
+    ``--task`` path is ``compute_task_diagnostics(get_task, list_events,
+    list_runs, graph)``; before this fix it returned no diagnostics for it.
+    """
+    blocked_at = 1_793_642_430     # 2026-11-02T12:00:30Z
+    commented_at = 1_793_642_783   # +5m53s
+    now = blocked_at + 8 * 24 * 3600
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="calendar wait", assignee="default", created_by="default",
+            initial_status="blocked",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "commented", {"author": "default", "len": 1432})
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ? "
+                "AND kind IN ('created', 'blocked')", (blocked_at, tid),
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'commented'",
+                (commented_at, tid),
+            )
+        # The CLI's --task path: task row + events + runs + graph context.
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        runs = kb.list_runs(conn, tid)
+        graph = kb.task_graph_context(conn, tid)
+
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph, now=now)
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    d = diags[0]
+    assert d.data["blocked_at"] == blocked_at
+    assert d.data["comment_at"] == commented_at
+    assert d.data["blocked_hours"] == pytest.approx(192, abs=0.1)
+
+
 
 
 

@@ -1023,6 +1023,10 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
+### Blocked diagnostics re-arm
+
+`hermes kanban diagnostics` raises `stuck_in_blocked` for a card that has been `blocked` longer than `kanban.diagnostics.blocked_stale_hours` (default 24). The clock is aged from the newest of the `blocked` event and the card's newest comment, not from the block alone: a comment is engagement — "the human just said something, stop nagging" — so it silences the notice for one threshold window, then the notice returns if the card is still blocked and names the comment that did not resolve it. Only `unblocked` (a real discharge) suppresses the rule outright, so a card parked for a calendar wait cannot sit for days behind a single early evidence note.
+
 ### Scheduled task starts (`scheduled_at`)
 
 Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
